@@ -16,6 +16,7 @@ class Opportunity:
     description: str
     solicitation_number: str = ""
     source: str = "mock"
+    source_portal: str = "Mock Portal"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -25,6 +26,7 @@ class Opportunity:
             "description": self.description,
             "solicitation_number": self.solicitation_number,
             "source": self.source,
+            "source_portal": self.source_portal,
         }
 
 
@@ -35,19 +37,22 @@ class OpportunityScraper:
 
     def fetch_opportunities(
         self,
-        limit: int = 5,
+        limit: int = 10,
         keyword: str | None = None,
         state: str | None = None,
+        location: str | None = None,
     ) -> list[Opportunity]:
         if self.source == "sam" and self.api_key:
             try:
                 opportunities = self._fetch_from_sam(limit=limit, keyword=keyword, state=state)
                 if opportunities:
-                    return opportunities
+                    return self._apply_filters(opportunities, keyword=keyword, state=state, location=location)
             except Exception:
                 pass
 
-        return self._fetch_mock(limit=limit, keyword=keyword, state=state)
+        mock_opportunities = self._mock_opportunities()
+        filtered = self._apply_filters(mock_opportunities, keyword=keyword, state=state, location=location)
+        return filtered[:limit]
 
     def _fetch_from_sam(
         self,
@@ -72,33 +77,76 @@ class OpportunityScraper:
         payload = response.json()
 
         notices = payload.get("opportunitiesData", [])
-        opportunities = []
-        for notice in notices:
-            opportunities.append(
-                Opportunity(
-                    title=notice.get("title") or notice.get("noticeTitle") or "Untitled opportunity",
-                    naics_code=str(notice.get("naicsCode") or ""),
-                    location=self._build_location(notice),
-                    description=notice.get("description") or notice.get("summary") or "",
-                    solicitation_number=notice.get("solicitationNumber") or "",
-                    source="sam",
-                )
+        return [
+            Opportunity(
+                title=notice.get("title") or notice.get("noticeTitle") or "Untitled opportunity",
+                naics_code=str(notice.get("naicsCode") or ""),
+                location=self._build_location(notice),
+                description=notice.get("description") or notice.get("summary") or "",
+                solicitation_number=notice.get("solicitationNumber") or "",
+                source="sam",
+                source_portal="SAM.gov",
             )
-        return opportunities
+            for notice in notices
+        ]
 
-    def _fetch_mock(
-        self,
-        limit: int,
-        keyword: str | None,
-        state: str | None,
-    ) -> list[Opportunity]:
-        opportunities = [
+    def _mock_opportunities(self) -> list[Opportunity]:
+        return [
+            Opportunity(
+                title="City Utilities Network Hardware Refresh",
+                naics_code="334111",
+                location="Springfield, MO",
+                description="City of Springfield utility division seeks switches, network monitoring, and installation support.",
+                solicitation_number="SGF-001",
+                source_portal="City of Springfield Bid Portal",
+            ),
+            Opportunity(
+                title="Downtown Signal and Streetlight Maintenance",
+                naics_code="238210",
+                location="Springfield, MO",
+                description="Springfield public works bid for electrical maintenance, signal cabinet upgrades, and field engineering.",
+                solicitation_number="SGF-002",
+                source_portal="City of Springfield Bid Portal",
+            ),
+            Opportunity(
+                title="Greene County Fleet Parts and Service",
+                naics_code="811111",
+                location="Greene County, MO",
+                description="Greene County seeks fleet maintenance, logistics coordination, and repair parts for county vehicles based in Springfield.",
+                solicitation_number="GC-001",
+                source_portal="Greene County Procurement",
+            ),
+            Opportunity(
+                title="Greene County Justice Center Janitorial Services",
+                naics_code="561720",
+                location="Greene County, MO",
+                description="Custodial and building cleaning services for county justice facilities in the Springfield area.",
+                solicitation_number="GC-002",
+                source_portal="Greene County Procurement",
+            ),
+            Opportunity(
+                title="Missouri Statewide IT Help Desk Support",
+                naics_code="541513",
+                location="Jefferson City, MO",
+                description="Missouri statewide portal opportunity for help desk operations supporting field offices including Springfield.",
+                solicitation_number="MO-001",
+                source_portal="MissouriBUYS Statewide Portal",
+            ),
+            Opportunity(
+                title="Missouri Parks Groundskeeping - Southwest Region",
+                naics_code="561730",
+                location="Springfield, MO",
+                description="Statewide groundskeeping and landscaping contract covering Springfield-area park properties.",
+                solicitation_number="MO-002",
+                source_portal="MissouriBUYS Statewide Portal",
+            ),
             Opportunity(
                 title="Cloud Hosting Modernization Support",
                 naics_code="541512",
                 location="Washington, DC",
                 description="Migration of legacy systems to a secure cloud environment with cybersecurity controls.",
                 solicitation_number="MOCK-001",
+                source_portal="Federal Mock Portal",
             ),
             Opportunity(
                 title="Medical Supply Distribution Services",
@@ -106,31 +154,19 @@ class OpportunityScraper:
                 location="San Diego, CA",
                 description="Provide warehousing and distribution of laboratory and medical consumables to regional clinics.",
                 solicitation_number="MOCK-002",
-            ),
-            Opportunity(
-                title="Federal Building Renovation Project",
-                naics_code="236220",
-                location="Denver, CO",
-                description="Renovation and facility maintenance for a federal office building, including engineering support.",
-                solicitation_number="MOCK-003",
-            ),
-            Opportunity(
-                title="Freight and Logistics Coordination",
-                naics_code="488510",
-                location="Norfolk, VA",
-                description="Coordinate freight movement, shipment tracking, and warehouse routing for defense cargo.",
-                solicitation_number="MOCK-004",
-            ),
-            Opportunity(
-                title="Data Analytics Platform Integration",
-                naics_code="541511",
-                location="Austin, TX",
-                description="Implement data pipelines, dashboarding, and software integration for agency reporting systems.",
-                solicitation_number="MOCK-005",
+                source_portal="Federal Mock Portal",
             ),
         ]
 
+    def _apply_filters(
+        self,
+        opportunities: list[Opportunity],
+        keyword: str | None,
+        state: str | None,
+        location: str | None,
+    ) -> list[Opportunity]:
         filtered = opportunities
+
         if keyword:
             keyword_lower = keyword.lower()
             filtered = [
@@ -138,11 +174,22 @@ class OpportunityScraper:
                 for item in filtered
                 if keyword_lower in item.title.lower() or keyword_lower in item.description.lower()
             ]
+
         if state:
             state_upper = state.upper()
-            filtered = [item for item in filtered if item.location.endswith(state_upper)]
+            filtered = [item for item in filtered if item.location.upper().endswith(state_upper)]
 
-        return filtered[:limit]
+        if location:
+            location_lower = location.lower()
+            filtered = [
+                item
+                for item in filtered
+                if location_lower in item.location.lower()
+                or location_lower in item.description.lower()
+                or location_lower in item.source_portal.lower()
+            ]
+
+        return filtered
 
     @staticmethod
     def _build_location(notice: dict[str, Any]) -> str:
