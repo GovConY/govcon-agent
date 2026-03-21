@@ -2,10 +2,17 @@ from __future__ import annotations
 
 import argparse
 import json
+from collections import defaultdict
 from typing import Any
 
 from matcher import SupplierMatcher
-from scraper import OpportunityScraper
+from scraper import (
+    MANUAL_REVIEW_SOURCE,
+    MOCK_SOURCE,
+    PARTIALLY_PARSED_SOURCE,
+    WORKING_LIVE_SOURCE,
+    OpportunityScraper,
+)
 
 DEFAULT_SUPPLIERS = [
     {
@@ -30,22 +37,29 @@ DEFAULT_SUPPLIERS = [
     },
 ]
 
+STATUS_ORDER = [
+    WORKING_LIVE_SOURCE,
+    PARTIALLY_PARSED_SOURCE,
+    MANUAL_REVIEW_SOURCE,
+    MOCK_SOURCE,
+]
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Scrape contract opportunities and match them to potential suppliers."
+        description="Collect regional procurement opportunities for Springfield, Missouri and nearby official public sources."
     )
     parser.add_argument(
         "--source",
-        choices=["sam", "mock"],
+        choices=["mock", "live", "all"],
         default="mock",
-        help="Use live SAM.gov API data or bundled mock data.",
+        help="Use bundled mock data, live official source adapters, or both.",
     )
     parser.add_argument(
         "--limit",
         type=int,
         default=10,
-        help="Maximum number of opportunities to retrieve.",
+        help="Maximum number of opportunity rows to return.",
     )
     parser.add_argument(
         "--output",
@@ -56,63 +70,46 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--keyword",
         default=None,
-        help="Optional keyword to pass through to the scraper.",
+        help="Optional keyword filter applied to titles and descriptions.",
     )
     parser.add_argument(
         "--state",
         default=None,
-        help="Optional two-letter state filter for SAM.gov requests or mock records.",
+        help="Optional state filter, such as MO.",
     )
     parser.add_argument(
         "--location",
         default=None,
-        help="Optional city/county/location text filter such as 'Springfield' or 'Greene County'.",
+        help="Optional city/county/location filter such as Springfield or Greene County.",
     )
     return parser
 
 
-def enrich_opportunities(
+def enrich_results(
     source: str,
     limit: int,
     keyword: str | None,
     state: str | None,
     location: str | None,
-) -> list[dict[str, Any]]:
+) -> dict[str, list[dict[str, Any]]]:
     scraper = OpportunityScraper(source=source)
     matcher = SupplierMatcher(DEFAULT_SUPPLIERS)
+    raw_results = scraper.fetch_opportunities(limit=limit, keyword=keyword, state=state, location=location)
 
-    opportunities = scraper.fetch_opportunities(
-        limit=limit,
-        keyword=keyword,
-        state=state,
-        location=location,
-    )
-    results = []
-
-    for opportunity in opportunities:
+    opportunities = []
+    for opportunity in raw_results["opportunities"]:
         opportunity_dict = opportunity.to_dict()
         opportunity_dict["supplier_matches"] = matcher.match(opportunity)
-        results.append(opportunity_dict)
+        opportunities.append(opportunity_dict)
 
-    return results
+    source_reports = [report.to_dict() for report in raw_results["source_reports"]]
+    return {
+        "opportunities": opportunities,
+        "source_reports": source_reports,
+    }
 
 
-def render_table(results: list[dict[str, Any]]) -> str:
-    headers = ["Title", "Portal", "NAICS", "Location", "Top Suppliers"]
-    rows = []
-
-    for item in results:
-        supplier_names = ", ".join(match["supplier"] for match in item["supplier_matches"][:2]) or "No match"
-        rows.append(
-            [
-                item["title"],
-                item.get("source_portal") or item.get("source") or "N/A",
-                item["naics_code"] or "N/A",
-                item["location"] or "N/A",
-                supplier_names,
-            ]
-        )
-
+def render_table(rows: list[list[str]], headers: list[str]) -> str:
     column_widths = [len(header) for header in headers]
     for row in rows:
         for index, value in enumerate(row):
@@ -122,21 +119,67 @@ def render_table(results: list[dict[str, Any]]) -> str:
         return " | ".join(str(value).ljust(column_widths[index]) for index, value in enumerate(row))
 
     separator = "-+-".join("-" * width for width in column_widths)
-    table_lines = [format_row(headers), separator]
+    lines = [format_row(headers), separator]
+    lines.extend(format_row(row) for row in rows)
+    return "\n".join(lines)
+
+
+def render_source_report_table(source_reports: list[dict[str, Any]]) -> str:
+    grouped_reports: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for report in source_reports:
+        grouped_reports[str(report["adapter_status"])].append(report)
+
+    sections = []
+    for status in STATUS_ORDER:
+        reports = grouped_reports.get(status, [])
+        if not reports:
+            continue
+
+        rows = [
+            [
+                report["agency"],
+                report["portal"],
+                report["region"],
+                str(report["parsed_count"]),
+                report["note"],
+                report["source_url"],
+            ]
+            for report in reports
+        ]
+        headers = ["Agency", "Portal", "Region", "Rows", "Notes", "URL"]
+        sections.append(status.upper())
+        sections.append(render_table(rows, headers))
+
+    return "\n\n".join(sections)
+
+
+def render_opportunity_table(opportunities: list[dict[str, Any]]) -> str:
+    headers = ["Title", "Agency", "Portal", "Location", "Due Date", "Solicitation Type", "Source Type", "URL"]
+    rows = [
+        [
+            item["title"],
+            item["agency"],
+            item["portal"],
+            item["location"] or "N/A",
+            item["due_date"] or "N/A",
+            item["solicitation_type"] or "N/A",
+            item["source_type"],
+            item["url"] or "N/A",
+        ]
+        for item in opportunities
+    ]
 
     if not rows:
-        table_lines.append("No opportunities found for the selected filters.")
-    else:
-        table_lines.extend(format_row(row) for row in rows)
+        rows = [["No opportunities found", "", "", "", "", "", "", ""]]
 
-    return "\n".join(table_lines)
+    return render_table(rows, headers)
 
 
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
 
-    results = enrich_opportunities(
+    results = enrich_results(
         source=args.source,
         limit=args.limit,
         keyword=args.keyword,
@@ -146,8 +189,13 @@ def main() -> None:
 
     if args.output == "json":
         print(json.dumps(results, indent=2))
-    else:
-        print(render_table(results))
+        return
+
+    print("SOURCE ADAPTER STATUS")
+    print(render_source_report_table(results["source_reports"]))
+    print()
+    print("OPPORTUNITY RESULTS")
+    print(render_opportunity_table(results["opportunities"]))
 
 
 if __name__ == "__main__":

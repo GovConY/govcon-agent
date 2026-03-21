@@ -7,7 +7,7 @@ from typing import Iterable
 
 from scraper import Opportunity
 
-TOKEN_PATTERN = re.compile(r"\b[a-z0-9]{3,}\b")
+TOKEN_PATTERN = re.compile(r"\b[a-z0-9]{2,}\b")
 
 
 @dataclass(slots=True)
@@ -21,14 +21,24 @@ class SupplierMatcher:
         self.suppliers = [
             SupplierProfile(
                 name=str(supplier["name"]),
-                keywords={keyword.lower() for keyword in supplier.get("keywords", [])},
+                keywords={str(keyword).lower() for keyword in supplier.get("keywords", [])},
             )
             for supplier in suppliers
         ]
 
     def match(self, opportunity: Opportunity) -> list[dict[str, object]]:
         opportunity_tokens = self._tokenize(
-            f"{opportunity.title} {opportunity.description} {opportunity.naics_code} {opportunity.location}"
+            " ".join(
+                [
+                    opportunity.title,
+                    opportunity.agency,
+                    opportunity.portal,
+                    opportunity.location,
+                    opportunity.description,
+                    opportunity.naics_code,
+                    opportunity.solicitation_type,
+                ]
+            )
         )
         scored_matches = []
 
