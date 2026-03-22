@@ -58,6 +58,26 @@ Table output prints two sections:
 
 JSON output includes both `source_reports` and `opportunities`.
 
+When you need a slimmer machine-readable payload, use compact JSON mode:
+
+```bash
+python3 main.py --source live --output json --compact-json --state MO
+```
+
+Compact JSON keeps only:
+
+- `title`
+- `agency`
+- `portal`
+- `location`
+- `due_date`
+- `solicitation_type`
+- `source_type`
+- `url`
+- `match_score`
+- `score_reasons`
+- `supplier_matches`
+
 ## Limitations of live scraping
 
 - Many official procurement pages use vendor-hosted portals, JavaScript-heavy interfaces, bot protection, or request filtering.
@@ -71,11 +91,38 @@ Current official source coverage included by the live adapters:
 
 - **City of Springfield, MO** - official bid portal page
 - **Greene County, MO** - official procurement page
+- **SAM.gov** - official Get Opportunities Public API
 - **Missouri statewide procurement portal** - MissouriBUYS bid board
 - **Christian County, MO** - official county bidding opportunities page
 - **City of Nixa, MO** - official purchasing information page
 - **City of Ozark, MO** - official bid postings page
 - **City of Republic, MO** - official bid postings page
+
+## SAM.gov setup
+
+The SAM.gov live adapter uses the official **Get Opportunities Public API**:
+
+- Production endpoint: [https://api.sam.gov/opportunities/v2/search](https://api.sam.gov/opportunities/v2/search)
+- Official documentation: [SAM.gov Get Opportunities Public API](https://open.gsa.gov/api/get-opportunities-public-api/)
+
+Requirements:
+
+- a SAM.gov public API key
+- the `SAM_GOV_API_KEY` environment variable set before running live mode
+
+Example PowerShell setup:
+
+```powershell
+$env:SAM_GOV_API_KEY="your-public-api-key"
+python main.py --source live --state MO --location Springfield
+```
+
+Notes:
+
+- the SAM.gov Opportunities API requires `postedFrom` and `postedTo`; this project uses a rolling 30-day posted-date window so the existing CLI stays unchanged
+- the API paginates with `limit` and `offset`; the adapter follows pagination and normalizes each returned opportunity into the existing output schema
+- if the API key is missing, the adapter reports that clearly in the source status table instead of fabricating records
+- JSON output includes `match_score` and `score_reasons`, and table results are sorted by highest score first
 
 ## Example commands
 
@@ -83,4 +130,8 @@ Current official source coverage included by the live adapters:
 python3 main.py --source mock --output table --state MO --location Springfield
 python3 main.py --source live --output table --state MO --location Springfield
 python3 main.py --source all --output json --state MO --location Springfield
+python3 main.py --source live --state MO --naics 236220
+python3 main.py --source live --state MO --keyword construction --naics 236220,237310
+python3 main.py --source live --output json --keyword construction --naics 236220
+python3 main.py --source live --state MO --top 3
 ```

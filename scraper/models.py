@@ -18,6 +18,9 @@ class Opportunity:
     naics_code: str = ""
     source_key: str = ""
     adapter_status: str = ""
+    match_score: int = 0
+    score_reasons: list[str] | None = None
+    tier: str = "LOW PRIORITY"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -33,6 +36,9 @@ class Opportunity:
             "naics_code": self.naics_code,
             "source_key": self.source_key,
             "adapter_status": self.adapter_status,
+            "match_score": self.match_score,
+            "score_reasons": self.score_reasons or [],
+            "tier": self.tier,
         }
 
 

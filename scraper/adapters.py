@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import json
+import os
 import re
+from datetime import date, timedelta
 from html import unescape
 from html.parser import HTMLParser
 from typing import Iterable
 from urllib.error import HTTPError, URLError
-from urllib.parse import urljoin
+from urllib.parse import urlencode, urljoin
 from urllib.request import Request, urlopen
 
 from .models import Opportunity, SourceReport
@@ -30,6 +33,7 @@ class SourceAdapter:
         keyword: str | None = None,
         state: str | None = None,
         location: str | None = None,
+        naics_codes: set[str] | None = None,
     ) -> tuple[list[Opportunity], SourceReport]:
         raise NotImplementedError
 
@@ -57,6 +61,7 @@ class SourceAdapter:
         keyword: str | None,
         state: str | None,
         location: str | None,
+        naics_codes: set[str] | None = None,
     ) -> list[Opportunity]:
         filtered = list(opportunities)
 
@@ -99,6 +104,7 @@ class MockRegionalAdapter(SourceAdapter):
         keyword: str | None = None,
         state: str | None = None,
         location: str | None = None,
+        naics_codes: set[str] | None = None,
     ) -> tuple[list[Opportunity], SourceReport]:
         opportunities = [
             Opportunity(
@@ -186,7 +192,13 @@ class MockRegionalAdapter(SourceAdapter):
                 adapter_status=MOCK_SOURCE,
             ),
         ]
-        filtered = self._apply_filters(opportunities, keyword=keyword, state=state, location=location)
+        filtered = self._apply_filters(
+            opportunities,
+            keyword=keyword,
+            state=state,
+            location=location,
+            naics_codes=naics_codes,
+        )
         report = self._base_report(
             adapter_status=MOCK_SOURCE,
             note="Bundled regional mock records for testing and offline development.",
@@ -203,6 +215,7 @@ class CivicPlusBidAdapter(SourceAdapter):
         keyword: str | None = None,
         state: str | None = None,
         location: str | None = None,
+        naics_codes: set[str] | None = None,
     ) -> tuple[list[Opportunity], SourceReport]:
         try:
             html = self._fetch_page(self.source_url)
@@ -219,7 +232,13 @@ class CivicPlusBidAdapter(SourceAdapter):
             )
 
         opportunities = self._parse_live_rows(html)
-        filtered = self._apply_filters(opportunities, keyword=keyword, state=state, location=location)
+        filtered = self._apply_filters(
+            opportunities,
+            keyword=keyword,
+            state=state,
+            location=location,
+            naics_codes=naics_codes,
+        )
         if filtered:
             report = self._base_report(
                 adapter_status=WORKING_LIVE_SOURCE,
@@ -847,8 +866,9 @@ class MissouriBuysAdapter(SourceAdapter):
         keyword: str | None = None,
         state: str | None = None,
         location: str | None = None,
+        naics_codes: set[str] | None = None,
     ) -> tuple[list[Opportunity], SourceReport]:
-        del keyword, state, location
+        del keyword, state, location, naics_codes
         try:
             html = self._fetch_page(self.source_url)
         except (HTTPError, URLError, TimeoutError, OSError) as exc:
@@ -864,6 +884,277 @@ class MissouriBuysAdapter(SourceAdapter):
         return [], self._base_report(adapter_status=PARTIALLY_PARSED_SOURCE, note=note)
 
 
+class SamGovAdapter(SourceAdapter):
+    source_key = "sam_gov"
+    agency = "U.S. Federal Government"
+    portal = "SAM.gov Get Opportunities Public API"
+    region = "United States"
+    source_url = "https://api.sam.gov/opportunities/v2/search"
+    page_size = 100
+    max_records = 500
+    lookback_days = 30
+
+    def fetch(
+        self,
+        keyword: str | None = None,
+        state: str | None = None,
+        location: str | None = None,
+        naics_codes: set[str] | None = None,
+    ) -> tuple[list[Opportunity], SourceReport]:
+        api_key = os.getenv("SAM_GOV_API_KEY")
+        if not api_key:
+            return [], self._base_report(
+                adapter_status=PARTIALLY_PARSED_SOURCE,
+                note="SAM.gov adapter requires the SAM_GOV_API_KEY environment variable for the official public API.",
+            )
+
+        posted_from, posted_to = self._date_range()
+        page_index = 0
+        total_records: int | None = None
+        opportunities: list[Opportunity] = []
+
+        while True:
+            request_url = self._build_search_url(
+                api_key=api_key,
+                posted_from=posted_from,
+                posted_to=posted_to,
+                page_index=page_index,
+                keyword=keyword,
+                state=state,
+            )
+            try:
+                payload = self._fetch_json(request_url)
+            except HTTPError as exc:
+                if exc.code == 404:
+                    break
+                return [], self._base_report(
+                    adapter_status=MANUAL_REVIEW_SOURCE,
+                    note=f"SAM.gov API request failed: {exc}",
+                )
+            except (HTTPError, URLError, TimeoutError, OSError, ValueError, json.JSONDecodeError) as exc:
+                return [], self._base_report(
+                    adapter_status=MANUAL_REVIEW_SOURCE,
+                    note=f"SAM.gov API request failed: {exc}",
+                )
+
+            page_records = payload.get("opportunitiesData")
+            if not isinstance(page_records, list):
+                return [], self._base_report(
+                    adapter_status=PARTIALLY_PARSED_SOURCE,
+                    note="SAM.gov API response did not include an opportunitiesData array.",
+                )
+
+            total_records = self._coerce_int(payload.get("totalRecords"))
+            opportunities.extend(self._normalize_records(page_records))
+
+            page_index += 1
+            if not page_records:
+                break
+            if len(page_records) < self.page_size:
+                break
+            if total_records is not None and page_index * self.page_size >= total_records:
+                break
+            if page_index * self.page_size >= self.max_records:
+                break
+
+        filtered = self._apply_filters(
+            opportunities,
+            keyword=keyword,
+            state=state,
+            location=location,
+            naics_codes=naics_codes,
+        )
+        if filtered:
+            note = (
+                f"Parsed {len(filtered)} live SAM.gov opportunity record(s) from the official public API "
+                f"covering posted dates {posted_from.isoformat()} through {posted_to.isoformat()}."
+            )
+            if total_records is not None and total_records > self.max_records:
+                note += f" Results were capped after {self.max_records} records while paginating."
+            return filtered, self._base_report(
+                adapter_status=WORKING_LIVE_SOURCE,
+                note=note,
+                parsed_count=len(filtered),
+            )
+
+        if total_records == 0:
+            return [], self._base_report(
+                adapter_status=WORKING_LIVE_SOURCE,
+                note=(
+                    f"SAM.gov API returned no opportunities for posted dates "
+                    f"{posted_from.isoformat()} through {posted_to.isoformat()}."
+                ),
+            )
+
+        note = (
+            "SAM.gov API returned records, but none remained after normalization and local filtering."
+            if opportunities
+            else "SAM.gov API returned no normalizable opportunity rows for the current request."
+        )
+        return [], self._base_report(adapter_status=PARTIALLY_PARSED_SOURCE, note=note)
+
+    def _fetch_json(self, url: str) -> dict[str, object]:
+        body = self._fetch_page(url)
+        payload = json.loads(body)
+        if not isinstance(payload, dict):
+            raise ValueError("SAM.gov API response was not a JSON object")
+        return payload
+
+    def _build_search_url(
+        self,
+        api_key: str,
+        posted_from: date,
+        posted_to: date,
+        page_index: int,
+        keyword: str | None,
+        state: str | None,
+    ) -> str:
+        params: list[tuple[str, str]] = [
+            ("api_key", api_key),
+            ("postedFrom", posted_from.strftime("%m/%d/%Y")),
+            ("postedTo", posted_to.strftime("%m/%d/%Y")),
+            ("limit", str(self.page_size)),
+            ("offset", str(page_index)),
+        ]
+        if keyword:
+            params.append(("title", keyword))
+        if state:
+            params.append(("state", state))
+        return f"{self.source_url}?{urlencode(params)}"
+
+    def _normalize_records(self, records: list[object]) -> list[Opportunity]:
+        opportunities: list[Opportunity] = []
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+
+            payload = self._data_payload(record)
+            title = self._clean_value(payload.get("title") or record.get("title"))
+            if not title:
+                continue
+
+            opportunities.append(
+                Opportunity(
+                    title=title,
+                    agency=self._build_agency(payload),
+                    portal=self.portal,
+                    location=self._build_location(payload),
+                    due_date=self._build_due_date(payload),
+                    solicitation_type=self._build_solicitation_type(payload),
+                    source_type="live",
+                    url=self._build_url(payload),
+                    description=self._clean_value(payload.get("solicitationNumber") or record.get("solicitationNumber")),
+                    naics_code=self._clean_value(payload.get("naicsCode") or record.get("naicsCode")),
+                    source_key=self.source_key,
+                    adapter_status=WORKING_LIVE_SOURCE,
+                )
+            )
+        return opportunities
+
+    def _build_agency(self, record: dict[str, object]) -> str:
+        full_path = self._clean_value(record.get("fullParentPathName"))
+        if full_path:
+            return full_path
+
+        agency_parts = [
+            self._clean_value(record.get("department")),
+            self._clean_value(record.get("subtier") or record.get("subTier")),
+            self._clean_value(record.get("office")),
+        ]
+        agency = " / ".join(part for part in agency_parts if part)
+        return agency or self.agency
+
+    def _build_location(self, payload: dict[str, object]) -> str:
+        place = payload.get("placeOfPerformance")
+        if isinstance(place, dict):
+            city = self._object_or_scalar_value(place.get("city"), "name")
+            state = self._object_or_scalar_value(place.get("state"), "code")
+            location = ", ".join(part for part in [city, state] if part).strip(", ")
+            if location.strip():
+                return location.strip()
+
+        office = payload.get("officeAddress")
+        if isinstance(office, dict):
+            city = self._clean_value(office.get("city"))
+            state = self._clean_value(office.get("state"))
+            location = ", ".join(part for part in [city, state] if part).strip(", ")
+            if location.strip():
+                return location.strip()
+
+        return ""
+
+    def _build_solicitation_type(self, payload: dict[str, object]) -> str:
+        current_type = self._clean_value(payload.get("type"))
+        if current_type:
+            return current_type
+        return self._clean_value(payload.get("baseType"))
+
+    def _build_url(self, payload: dict[str, object]) -> str:
+        ui_link = self._clean_value(payload.get("uiLink"))
+        if ui_link:
+            return ui_link
+        additional_info = self._clean_value(payload.get("additionalInfoLink"))
+        if additional_info:
+            return additional_info
+        links = payload.get("links")
+        if isinstance(links, list):
+            for link in links:
+                if not isinstance(link, dict):
+                    continue
+                href = self._clean_value(link.get("href"))
+                if href:
+                    return href
+        return ""
+
+    def _build_due_date(self, payload: dict[str, object]) -> str:
+        return self._clean_value(payload.get("responseDeadLine") or payload.get("reponseDeadLine"))
+
+    @staticmethod
+    def _coerce_int(value: object) -> int | None:
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str) and value.isdigit():
+            return int(value)
+        return None
+
+    @staticmethod
+    def _clean_value(value: object) -> str:
+        if value is None:
+            return ""
+        text = str(value).strip()
+        if text.lower() == "null":
+            return ""
+        return text
+
+    @staticmethod
+    def _data_payload(record: dict[str, object]) -> dict[str, object]:
+        data = record.get("data")
+        if isinstance(data, dict):
+            merged = dict(record)
+            for key, value in data.items():
+                merged.setdefault(key, value)
+            return merged
+        return record
+
+    def _date_range(self) -> tuple[date, date]:
+        posted_to = date.today()
+        posted_from = posted_to - timedelta(days=self.lookback_days)
+        return posted_from, posted_to
+
+    def _nested_clean(self, payload: dict[str, object], *keys: str) -> str:
+        value: object = payload
+        for key in keys:
+            if not isinstance(value, dict):
+                return ""
+            value = value.get(key)
+        return self._clean_value(value)
+
+    def _object_or_scalar_value(self, value: object, nested_key: str) -> str:
+        if isinstance(value, dict):
+            return self._clean_value(value.get(nested_key))
+        return self._clean_value(value)
+
+
 class GreeneCountyAdapter(SourceAdapter):
     source_key = "greene_county"
     agency = "Greene County"
@@ -876,6 +1167,7 @@ class GreeneCountyAdapter(SourceAdapter):
         keyword: str | None = None,
         state: str | None = None,
         location: str | None = None,
+        naics_codes: set[str] | None = None,
     ) -> tuple[list[Opportunity], SourceReport]:
         try:
             html = self._fetch_page(self.source_url)
@@ -902,7 +1194,13 @@ class GreeneCountyAdapter(SourceAdapter):
                 )
 
             opportunities = self._parse_beacon_listings(vendor_html, beacon_url)
-            filtered = self._apply_filters(opportunities, keyword=keyword, state=state, location=location)
+            filtered = self._apply_filters(
+                opportunities,
+                keyword=keyword,
+                state=state,
+                location=location,
+                naics_codes=naics_codes,
+            )
             if filtered:
                 return filtered, self._base_report(
                     adapter_status=WORKING_LIVE_SOURCE,
@@ -984,8 +1282,9 @@ class ChristianCountyAdapter(SourceAdapter):
         keyword: str | None = None,
         state: str | None = None,
         location: str | None = None,
+        naics_codes: set[str] | None = None,
     ) -> tuple[list[Opportunity], SourceReport]:
-        del keyword, state, location
+        del keyword, state, location, naics_codes
         try:
             html = self._fetch_page(self.source_url)
         except (HTTPError, URLError, TimeoutError, OSError) as exc:
@@ -1018,8 +1317,9 @@ class NixaAdapter(SourceAdapter):
         keyword: str | None = None,
         state: str | None = None,
         location: str | None = None,
+        naics_codes: set[str] | None = None,
     ) -> tuple[list[Opportunity], SourceReport]:
-        del keyword, state, location
+        del keyword, state, location, naics_codes
         try:
             html = self._fetch_page(self.source_url)
         except (HTTPError, URLError, TimeoutError, OSError) as exc:
@@ -1050,6 +1350,7 @@ class OpportunityScraper:
         keyword: str | None = None,
         state: str | None = None,
         location: str | None = None,
+        naics_codes: set[str] | None = None,
     ) -> dict[str, list[dict[str, object]] | list[Opportunity] | list[SourceReport]]:
         adapters: list[SourceAdapter] = []
         if self.source in {"mock", "all"}:
@@ -1059,6 +1360,7 @@ class OpportunityScraper:
                 [
                     SpringfieldAdapter(),
                     GreeneCountyAdapter(),
+                    SamGovAdapter(),
                     MissouriBuysAdapter(),
                     ChristianCountyAdapter(),
                     NixaAdapter(),
@@ -1071,11 +1373,15 @@ class OpportunityScraper:
         source_reports: list[SourceReport] = []
 
         for adapter in adapters:
-            adapter_opportunities, report = adapter.fetch(keyword=keyword, state=state, location=location)
+            adapter_opportunities, report = adapter.fetch(
+                keyword=keyword,
+                state=state,
+                location=location,
+                naics_codes=naics_codes,
+            )
             opportunities.extend(adapter_opportunities)
             source_reports.append(report)
 
-        opportunities = opportunities[:limit]
         return {
             "opportunities": opportunities,
             "source_reports": source_reports,
