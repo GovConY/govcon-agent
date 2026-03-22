@@ -437,6 +437,111 @@ class OzarkAdapter(CivicPlusBidAdapter):
     region = "Ozark, MO"
     source_url = "https://www.ozarkmissouri.com/Bids.aspx"
 
+    def _parse_live_rows(self, html: str) -> list[Opportunity]:
+        parser = CivicPlusLinkParser()
+        parser.feed(html)
+
+        opportunities: list[Opportunity] = []
+        for link in parser.links:
+            href = link["href"]
+            title = link["title"]
+
+            if not self._is_real_bid_link(title, href):
+                continue
+
+            opportunities.append(
+                Opportunity(
+                    title=title,
+                    agency=self.agency,
+                    portal=self.portal,
+                    location=self.region,
+                    due_date="",
+                    solicitation_type=self._infer_solicitation_type(title, href),
+                    source_type="live",
+                    url=self._absolute_url(href),
+                    description="Live bid extracted from official Ozark bid page.",
+                    source_key=self.source_key,
+                    adapter_status=WORKING_LIVE_SOURCE,
+                )
+            )
+
+        return opportunities
+
+    @staticmethod
+    def _is_real_bid_link(title: str, href: str) -> bool:
+        clean_title = title.strip()
+        clean_href = href.strip()
+        lower_title = clean_title.lower()
+        lower_href = clean_href.lower()
+
+        blocked_titles = {
+            "skip to main content",
+            "create a website account",
+            "sign in",
+            "sign up",
+            "home",
+            "living in ozark",
+        }
+        blocked_href_fragments = (
+            "javascript:",
+            "mailto:",
+            "/directory",
+            "/jobs",
+            "/calendar",
+            "/faq",
+            "/forms",
+            "/government",
+            "/departments",
+            "/business",
+            "/visitors",
+            "/living-in-ozark",
+        )
+
+        if not clean_title or len(clean_title) < 8:
+            return False
+        if lower_title in blocked_titles:
+            return False
+        if any(fragment in lower_href for fragment in blocked_href_fragments):
+            return False
+        if lower_href.startswith("#"):
+            return False
+
+        if "bidid=" in lower_href:
+            return True
+
+        procurement_keywords = (
+            "bid",
+            "rfp",
+            "rfq",
+            "ifb",
+            "proposal",
+            "quote",
+            "invitation",
+            "solicitation",
+        )
+        if "/documentcenter/view/" in lower_href and any(keyword in lower_title for keyword in procurement_keywords):
+            return True
+
+        return False
+
+    @staticmethod
+    def _infer_solicitation_type(title: str, href: str) -> str:
+        value = f"{title} {href}".lower()
+        mappings = [
+            ("request for proposal", "Request for Proposal"),
+            ("rfp", "Request for Proposal"),
+            ("request for qualifications", "Request for Qualifications"),
+            ("rfq", "Request for Qualifications"),
+            ("invitation for bid", "Invitation for Bid"),
+            ("ifb", "Invitation for Bid"),
+            ("quote", "Request for Quote"),
+            ("bid", "Bid"),
+        ]
+        for needle, normalized in mappings:
+            if needle in value:
+                return normalized
+        return ""
+
 
 class RepublicAdapter(CivicPlusBidAdapter):
     source_key = "republic_city"
@@ -601,6 +706,44 @@ class SpringfieldBidListParser(HTMLParser):
         self._current_text_parts = []
 
 
+class CivicPlusLinkParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.links: list[dict[str, str]] = []
+        self._seen_pairs: set[tuple[str, str]] = set()
+        self._current_href: str | None = None
+        self._current_text_parts: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag != "a":
+            return
+
+        href = dict(attrs).get("href")
+        if not href:
+            return
+
+        self._current_href = href
+        self._current_text_parts = []
+
+    def handle_data(self, data: str) -> None:
+        if self._current_href is not None:
+            self._current_text_parts.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag != "a" or self._current_href is None:
+            return
+
+        title = unescape(re.sub(r"\s+", " ", "".join(self._current_text_parts))).strip()
+        href = self._current_href
+        key = (href, title)
+        if title and key not in self._seen_pairs:
+            self.links.append({"href": href, "title": title})
+            self._seen_pairs.add(key)
+
+        self._current_href = None
+        self._current_text_parts = []
+
+
 class PlainTextHTMLParser(HTMLParser):
     def __init__(self) -> None:
         super().__init__()
@@ -619,6 +762,77 @@ class PlainTextHTMLParser(HTMLParser):
 
     def get_text(self) -> str:
         return unescape(re.sub(r"\s+", " ", "".join(self._parts))).strip()
+
+
+class VendorLinkParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.links: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag != "a":
+            return
+        href = dict(attrs).get("href")
+        if href:
+            self.links.append(href)
+
+    def find_first_url(self, *needles: str) -> str:
+        lowered_needles = tuple(needle.lower() for needle in needles)
+        for href in self.links:
+            lower_href = href.lower()
+            if all(needle in lower_href for needle in lowered_needles):
+                return href
+        for href in self.links:
+            if "beaconbid.com" in href.lower():
+                return href
+        return ""
+
+
+class BeaconSolicitationParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.listings: list[dict[str, str]] = []
+        self._current_href: str | None = None
+        self._current_parts: list[str] = []
+        self._seen_hrefs: set[str] = set()
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag != "a":
+            return
+
+        href = dict(attrs).get("href")
+        if not href:
+            return
+
+        if "/solicitations/" not in href.lower():
+            return
+
+        self._current_href = href
+        self._current_parts = []
+
+    def handle_data(self, data: str) -> None:
+        if self._current_href is not None:
+            self._current_parts.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag != "a" or self._current_href is None:
+            return
+
+        href = self._current_href
+        title = unescape(re.sub(r"\s+", " ", "".join(self._current_parts))).strip()
+        if title and href not in self._seen_hrefs:
+            self.listings.append(
+                {
+                    "title": title,
+                    "href": href,
+                    "due_date": "",
+                    "solicitation_type": "",
+                }
+            )
+            self._seen_hrefs.add(href)
+
+        self._current_href = None
+        self._current_parts = []
 
 
 class MissouriBuysAdapter(SourceAdapter):
@@ -663,7 +877,6 @@ class GreeneCountyAdapter(SourceAdapter):
         state: str | None = None,
         location: str | None = None,
     ) -> tuple[list[Opportunity], SourceReport]:
-        del keyword, state, location
         try:
             html = self._fetch_page(self.source_url)
         except (HTTPError, URLError, TimeoutError, OSError) as exc:
@@ -672,16 +885,91 @@ class GreeneCountyAdapter(SourceAdapter):
                 note=f"Official Greene County bidding page could not be fetched automatically: {exc}",
             )
 
+        landing_parser = VendorLinkParser()
+        landing_parser.feed(html)
+        beacon_url = landing_parser.find_first_url("beaconbid.com", "solicitation", "open")
+
+        if beacon_url:
+            try:
+                vendor_html = self._fetch_page(beacon_url)
+            except (HTTPError, URLError, TimeoutError, OSError) as exc:
+                return [], self._base_report(
+                    adapter_status=PARTIALLY_PARSED_SOURCE,
+                    note=(
+                        "Official Greene County page identifies Beacon Bid as the bidding platform, "
+                        f"but the linked vendor portal could not be fetched automatically: {exc}"
+                    ),
+                )
+
+            opportunities = self._parse_beacon_listings(vendor_html, beacon_url)
+            filtered = self._apply_filters(opportunities, keyword=keyword, state=state, location=location)
+            if filtered:
+                return filtered, self._base_report(
+                    adapter_status=WORKING_LIVE_SOURCE,
+                    note=f"Parsed {len(filtered)} live solicitation(s) from Greene County's Beacon Bid portal.",
+                    parsed_count=len(filtered),
+                )
+
+            if "enable javascript" in vendor_html.lower():
+                return [], self._base_report(
+                    adapter_status=PARTIALLY_PARSED_SOURCE,
+                    note=(
+                        "Official Greene County page links to Beacon Bid for open solicitations, "
+                        "but the vendor portal HTML only returns a JavaScript-required shell and does not expose "
+                        "static solicitation rows for reliable extraction."
+                    ),
+                )
+
+            return [], self._base_report(
+                adapter_status=PARTIALLY_PARSED_SOURCE,
+                note=(
+                    "Official Greene County page links to Beacon Bid for open solicitations, "
+                    "but no structured solicitation rows or detail links were found in the vendor portal HTML."
+                ),
+            )
+
         if "beaconbid" in html.lower() or "vendor registry" in html.lower():
             return [], self._base_report(
                 adapter_status=PARTIALLY_PARSED_SOURCE,
-                note="Official Greene County page loaded and points to its bidding platform, but bid details were not extracted yet.",
+                note=(
+                    "Official Greene County page identifies Beacon Bid as the bidding platform, "
+                    "but no direct open-solicitations link was found in the current HTML."
+                ),
             )
 
         return [], self._base_report(
             adapter_status=MANUAL_REVIEW_SOURCE,
             note="Greene County page loaded, but the current structure is unsupported for automatic parsing.",
         )
+
+    def _parse_beacon_listings(self, html: str, vendor_url: str) -> list[Opportunity]:
+        parser = BeaconSolicitationParser()
+        parser.feed(html)
+
+        opportunities: list[Opportunity] = []
+        for listing in parser.listings:
+            title = listing["title"]
+            href = listing["href"]
+            if not title or not href:
+                continue
+
+            opportunities.append(
+                Opportunity(
+                    title=title,
+                    agency=self.agency,
+                    portal="Beacon Bid",
+                    location=self.region,
+                    due_date=listing.get("due_date", ""),
+                    solicitation_type=listing.get("solicitation_type", ""),
+                    source_type="live",
+                    url=urljoin(vendor_url, href),
+                    description="Live solicitation listing extracted from Greene County's Beacon Bid portal.",
+                    source_key=self.source_key,
+                    adapter_status=WORKING_LIVE_SOURCE,
+                )
+            )
+
+        return opportunities
 
 
 class ChristianCountyAdapter(SourceAdapter):
