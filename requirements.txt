@@ -1,0 +1,1 @@
+# No third-party dependencies are required for the current mock and live-adapter implementation.
