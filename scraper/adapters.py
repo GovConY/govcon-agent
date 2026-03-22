@@ -282,6 +282,153 @@ class SpringfieldAdapter(CivicPlusBidAdapter):
     region = "Springfield, MO"
     source_url = "https://www.springfieldmo.gov/Bids.aspx"
 
+    def __init__(self) -> None:
+        self._parse_failure_reason = (
+            "Springfield page loaded, but no bid detail links matching Bids.aspx?bidID=... were found in the HTML."
+        )
+
+    def _partial_parse_note(self) -> str:
+        return self._parse_failure_reason
+
+    def _parse_live_rows(self, html: str) -> list[Opportunity]:
+        list_parser = SpringfieldBidListParser()
+        list_parser.feed(html)
+
+        if not list_parser.bid_links:
+            self._parse_failure_reason = (
+                "Springfield page loaded, but no bid detail links matching Bids.aspx?bidID=... were found in the HTML."
+            )
+            return []
+
+        opportunities: list[Opportunity] = []
+        detail_pages_found = 0
+        structured_records_found = 0
+
+        for bid_link in list_parser.bid_links:
+            detail_url = self._absolute_url(bid_link["href"])
+            detail_pages_found += 1
+
+            try:
+                detail_html = self._fetch_page(detail_url)
+            except (HTTPError, URLError, TimeoutError, OSError):
+                continue
+
+            detail = self._parse_bid_detail(detail_html)
+            title = detail.get("title") or bid_link["title"]
+            solicitation_type = self._normalize_solicitation_type(
+                detail.get("bid_number", ""),
+                detail.get("description", ""),
+                title,
+            )
+            due_date = self._extract_due_date(detail.get("description", ""))
+
+            if not title:
+                continue
+
+            if detail.get("title") or detail.get("bid_number") or detail.get("description"):
+                structured_records_found += 1
+
+            opportunities.append(
+                Opportunity(
+                    title=title,
+                    agency=self.agency,
+                    portal=self.portal,
+                    location=self.region,
+                    due_date=due_date,
+                    solicitation_type=solicitation_type,
+                    source_type="live",
+                    url=detail_url,
+                    description=detail.get("description", ""),
+                    source_key=self.source_key,
+                    adapter_status=WORKING_LIVE_SOURCE,
+                )
+            )
+
+        if opportunities:
+            return opportunities
+
+        if detail_pages_found and not structured_records_found:
+            self._parse_failure_reason = (
+                "Springfield listing exposed bid detail links, but the fetched detail HTML did not contain "
+                "structured Bid Title/Bid Number/Description fields to populate opportunity records."
+            )
+        else:
+            self._parse_failure_reason = (
+                "Springfield listing exposed bid detail links, but none of the linked detail pages could be fetched."
+            )
+        return []
+
+    def _parse_bid_detail(self, html: str) -> dict[str, str]:
+        text_parser = PlainTextHTMLParser()
+        text_parser.feed(html)
+        text = text_parser.get_text()
+
+        return {
+            "bid_number": self._extract_labeled_value(text, "Bid Number"),
+            "title": self._extract_labeled_value(text, "Bid Title"),
+            "category": self._extract_labeled_value(text, "Category"),
+            "status": self._extract_labeled_value(text, "Status"),
+            "description": self._extract_labeled_value(text, "Description"),
+        }
+
+    @staticmethod
+    def _extract_labeled_value(text: str, label: str) -> str:
+        pattern = re.compile(
+            rf"{re.escape(label)}\s*:\s*(?:\|\s*)?(.*?)"
+            r"(?=\s+(?:Bid Number|Bid Title|Category|Status|Description)\s*:|\Z)",
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        match = pattern.search(text)
+        if not match:
+            return ""
+        return re.sub(r"\s+", " ", match.group(1)).strip(" |")
+
+    @staticmethod
+    def _normalize_solicitation_type(*values: str) -> str:
+        haystack = " ".join(value for value in values if value).lower()
+        mappings = [
+            ("request for proposal", "Request for Proposal"),
+            ("rfp", "Request for Proposal"),
+            ("request for qualifications", "Request for Qualifications"),
+            ("rfq", "Request for Qualifications"),
+            ("invitation for bid", "Invitation for Bid"),
+            ("ifb", "Invitation for Bid"),
+            ("request for information", "Request for Information"),
+            ("rfi", "Request for Information"),
+            ("invitation to bid", "Invitation for Bid"),
+            ("bid", "Bid"),
+        ]
+        for needle, normalized in mappings:
+            if needle in haystack:
+                return normalized
+        return ""
+
+    @staticmethod
+    def _extract_due_date(description: str) -> str:
+        if not description:
+            return ""
+
+        patterns = [
+            re.compile(
+                r"by\s+([0-9]{1,2}:[0-9]{2}\s*[AP]\.?M\.?(?:\s*\([A-Z]+\))?)\s*,?\s*on\s+"
+                r"([A-Z]+,\s+[A-Z]+\s+\d{1,2},\s+\d{4})",
+                flags=re.IGNORECASE,
+            ),
+            re.compile(
+                r"due\s+(?:date|datetime)?\s*(?:is|:)?\s*"
+                r"([A-Z]+,\s+[A-Z]+\s+\d{1,2},\s+\d{4}(?:\s+[0-9]{1,2}:[0-9]{2}\s*[AP]\.?M\.?)?)",
+                flags=re.IGNORECASE,
+            ),
+        ]
+        for pattern in patterns:
+            match = pattern.search(description)
+            if not match:
+                continue
+            if len(match.groups()) == 2:
+                return f"{match.group(2).title()} {match.group(1).upper()}".strip()
+            return re.sub(r"\s+", " ", match.group(1)).strip()
+        return ""
+
 
 class OzarkAdapter(CivicPlusBidAdapter):
     source_key = "ozark_city"
@@ -415,6 +562,63 @@ class RepublicBidRowParser(HTMLParser):
             self._in_row = False
             self._current_cells = []
             self._current_href = None
+
+
+class SpringfieldBidListParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.bid_links: list[dict[str, str]] = []
+        self._seen_hrefs: set[str] = set()
+        self._current_href: str | None = None
+        self._current_text_parts: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag != "a":
+            return
+
+        href = dict(attrs).get("href")
+        if not href or "bidid=" not in href.lower():
+            return
+
+        self._current_href = href
+        self._current_text_parts = []
+
+    def handle_data(self, data: str) -> None:
+        if self._current_href is not None:
+            self._current_text_parts.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag != "a" or self._current_href is None:
+            return
+
+        title = unescape(re.sub(r"\s+", " ", "".join(self._current_text_parts))).strip()
+        href = self._current_href
+        if title and href not in self._seen_hrefs:
+            self.bid_links.append({"href": href, "title": title})
+            self._seen_hrefs.add(href)
+
+        self._current_href = None
+        self._current_text_parts = []
+
+
+class PlainTextHTMLParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self._parts: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag in {"br", "p", "div", "li", "tr", "td", "th", "section", "article"}:
+            self._parts.append(" ")
+
+    def handle_data(self, data: str) -> None:
+        self._parts.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in {"p", "div", "li", "tr", "td", "th", "section", "article"}:
+            self._parts.append(" ")
+
+    def get_text(self) -> str:
+        return unescape(re.sub(r"\s+", " ", "".join(self._parts))).strip()
 
 
 class MissouriBuysAdapter(SourceAdapter):
