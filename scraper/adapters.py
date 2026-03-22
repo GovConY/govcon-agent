@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import re
 from html import unescape
+from html.parser import HTMLParser
 from typing import Iterable
 from urllib.error import HTTPError, URLError
+from urllib.parse import urljoin
 from urllib.request import Request, urlopen
 
 from .models import Opportunity, SourceReport
@@ -213,23 +215,35 @@ class CivicPlusBidAdapter(SourceAdapter):
         if self.no_bid_marker in html:
             return [], self._base_report(
                 adapter_status=WORKING_LIVE_SOURCE,
-                note="Live source reachable; no open bid postings were listed at fetch time.",
+                note=self._no_open_bids_note(),
             )
 
-        opportunities = self._parse_civicplus_rows(html)
+        opportunities = self._parse_live_rows(html)
         filtered = self._apply_filters(opportunities, keyword=keyword, state=state, location=location)
         if filtered:
             report = self._base_report(
                 adapter_status=WORKING_LIVE_SOURCE,
-                note="Parsed live CivicPlus bid postings.",
+                note=self._parsed_bids_note(len(filtered)),
                 parsed_count=len(filtered),
             )
             return filtered, report
 
         return [], self._base_report(
             adapter_status=PARTIALLY_PARSED_SOURCE,
-            note="Source page loaded, but no structured bid rows were extracted from the current HTML.",
+            note=self._partial_parse_note(),
         )
+
+    def _no_open_bids_note(self) -> str:
+        return "Live source reachable; no open bid postings were listed at fetch time."
+
+    def _parsed_bids_note(self, parsed_count: int) -> str:
+        return f"Parsed {parsed_count} live CivicPlus bid posting(s)."
+
+    def _partial_parse_note(self) -> str:
+        return "Source page loaded, but no structured bid rows were extracted from the current HTML."
+
+    def _parse_live_rows(self, html: str) -> list[Opportunity]:
+        return self._parse_civicplus_rows(html)
 
     def _parse_civicplus_rows(self, html: str) -> list[Opportunity]:
         opportunities: list[Opportunity] = []
@@ -258,9 +272,7 @@ class CivicPlusBidAdapter(SourceAdapter):
         return opportunities[:10]
 
     def _absolute_url(self, href: str) -> str:
-        if href.startswith("http"):
-            return href
-        return self.source_url.rsplit("/", 1)[0] + "/" + href.lstrip("/")
+        return urljoin(self.source_url, href)
 
 
 class SpringfieldAdapter(CivicPlusBidAdapter):
@@ -285,6 +297,124 @@ class RepublicAdapter(CivicPlusBidAdapter):
     portal = "City of Republic Bid Postings"
     region = "Republic, MO"
     source_url = "https://www.republicmo.com/Bids.aspx"
+
+    def _no_open_bids_note(self) -> str:
+        return "Republic bid page reachable; no open bid postings were listed."
+
+    def _parsed_bids_note(self, parsed_count: int) -> str:
+        return f"Republic bid table parsed successfully with {parsed_count} posting(s)."
+
+    def _partial_parse_note(self) -> str:
+        return "Republic page loaded, but no structured bid rows were extracted from the official bid table."
+
+    def _parse_live_rows(self, html: str) -> list[Opportunity]:
+        parser = RepublicBidRowParser()
+        parser.feed(html)
+
+        opportunities: list[Opportunity] = []
+        for row in parser.rows:
+            cells = row["cells"]
+            href = row["href"]
+
+            if len(cells) < 4 or not href:
+                continue
+            if any(header in " ".join(cells).lower() for header in ("category", "bid title", "closing date", "bid number")):
+                continue
+
+            title = cells[1]
+            due_date = cells[2]
+            solicitation_type = self._normalize_solicitation_type(cells[0], title)
+            bid_number = cells[3]
+
+            if not title or not due_date or not bid_number:
+                continue
+
+            opportunities.append(
+                Opportunity(
+                    title=title,
+                    agency=self.agency,
+                    portal=self.portal,
+                    location=self.region,
+                    due_date=due_date,
+                    solicitation_type=solicitation_type,
+                    source_type="live",
+                    url=self._absolute_url(href),
+                    description=f"Republic bid posting {bid_number}",
+                    source_key=self.source_key,
+                    adapter_status=WORKING_LIVE_SOURCE,
+                )
+            )
+
+        return opportunities
+
+    @staticmethod
+    def _normalize_solicitation_type(category: str, title: str) -> str:
+        value = f"{category} {title}".lower()
+        mappings = [
+            ("request for proposal", "Request for Proposal"),
+            ("rfp", "Request for Proposal"),
+            ("request for qualifications", "Request for Qualifications"),
+            ("rfq", "Request for Qualifications"),
+            ("invitation for bid", "Invitation for Bid"),
+            ("ifb", "Invitation for Bid"),
+            ("bid", "Bid"),
+        ]
+        for needle, normalized in mappings:
+            if needle in value:
+                return normalized
+        return "Unspecified"
+
+
+class RepublicBidRowParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.rows: list[dict[str, object]] = []
+        self._in_row = False
+        self._in_cell = False
+        self._current_cells: list[str] = []
+        self._current_cell_parts: list[str] = []
+        self._current_href: str | None = None
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag == "tr":
+            self._in_row = True
+            self._current_cells = []
+            self._current_href = None
+            return
+
+        if not self._in_row:
+            return
+
+        if tag in {"td", "th"}:
+            self._in_cell = True
+            self._current_cell_parts = []
+            return
+
+        if self._in_cell and tag == "a" and self._current_href is None:
+            attributes = dict(attrs)
+            self._current_href = attributes.get("href")
+
+        if self._in_cell and tag == "br":
+            self._current_cell_parts.append(" ")
+
+    def handle_data(self, data: str) -> None:
+        if self._in_cell:
+            self._current_cell_parts.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in {"td", "th"} and self._in_cell:
+            cell_text = unescape(re.sub(r"\s+", " ", "".join(self._current_cell_parts))).strip()
+            self._current_cells.append(cell_text)
+            self._in_cell = False
+            self._current_cell_parts = []
+            return
+
+        if tag == "tr" and self._in_row:
+            if self._current_cells:
+                self.rows.append({"cells": self._current_cells, "href": self._current_href})
+            self._in_row = False
+            self._current_cells = []
+            self._current_href = None
 
 
 class MissouriBuysAdapter(SourceAdapter):
